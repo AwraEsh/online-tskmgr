@@ -12,11 +12,11 @@ from urllib.error import URLError
 import threading
 
 # ====== کانفیگ ======
-BALE_TOKEN  = os.environ.get("BALE_BOT_TOKEN", "")
-BALE_CHAT   = os.environ.get("BALE_CHAT_ID", "")
+BALE_TOKEN  = os.environ.get("BALE_BOT_TOKEN", "0")
+BALE_CHAT   = os.environ.get("BALE_CHAT_ID", "0")
 
-TG_TOKEN    = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT     = os.environ.get("TG_CHAT_ID", "")
+TG_TOKEN    = os.environ.get("TG_BOT_TOKEN", "0")
+TG_CHAT     = os.environ.get("TG_CHAT_ID", "0")
 
 ALERT_THRESHOLD = 90
 INTERVAL_NORMAL = 2

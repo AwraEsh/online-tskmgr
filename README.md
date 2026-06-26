@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="README-fa.md" style="color:#2196F3; font-size:18px; text-decoration:none; font-weight:bold;">
-    📖 ‌راهنمای فارسی — README-fa.md
+    📖 راهنمای فارسی — README-fa.md
   </a>
 </p>
 
@@ -54,6 +54,39 @@ bash start.sh
 ```
 
 The script checks dependencies, asks for tokens, creates `.env`, sets up systemd, and starts the bot.
+
+---
+
+## 📜 Helper Scripts
+
+### `start.sh` — Install & Run
+
+```bash
+bash start.sh
+```
+
+Does everything in one go:
+1. Checks and installs missing dependencies
+2. Asks for bot tokens and chat IDs
+3. Creates `.env` config file
+4. Sets up systemd user service
+5. Enables auto-start on boot
+6. Starts the bot
+
+### `disable.sh` — Stop & Disable
+
+```bash
+# Stop bot and disable auto-start (keeps service file)
+bash disable.sh
+
+# Stop bot, disable auto-start, AND remove service file completely
+bash disable.sh --remove-service
+```
+
+| Command | Stops bot | Disables auto-start | Removes service file |
+|---------|:---------:|:-------------------:|:--------------------:|
+| `bash disable.sh` | ✅ | ✅ | ❌ |
+| `bash disable.sh --remove-service` | ✅ | ✅ | ✅ |
 
 ---
 
