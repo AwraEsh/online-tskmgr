@@ -204,6 +204,8 @@ systemctl --user status bale-cpu-alert
 
 ## 🎛️ Service Management
 
+### Using systemctl (Manual)
+
 | Command | Description |
 |---------|-------------|
 | `systemctl --user start bale-cpu-alert` | Start the bot |
@@ -214,6 +216,14 @@ systemctl --user status bale-cpu-alert
 | `systemctl --user disable bale-cpu-alert` | Disable auto-start |
 | `journalctl --user -u bale-cpu-alert -f` | View live logs |
 | `journalctl --user -u bale-cpu-alert -e` | View error logs |
+
+### Using Scripts (Recommended)
+
+| Script | Description |
+|--------|-------------|
+| `bash start.sh` | Install dependencies, setup config, create service, enable auto-start, and start bot |
+| `bash disable.sh` | Stop bot, disable auto-start on boot |
+| `bash disable.sh --remove-service` | Stop bot, disable auto-start, AND remove service file completely |
 
 ### Enable lingering (run after logout)
 
