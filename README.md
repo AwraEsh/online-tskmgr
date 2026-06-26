@@ -1,4 +1,4 @@
-# System Monitor v5 - Bale + Telegram Bot 🔥🤖🎮💻
+# System Monitor v5 - Bale + Telegram Bot 
 
 > **A comprehensive system monitoring bot for Bale and Telegram**
 > 
