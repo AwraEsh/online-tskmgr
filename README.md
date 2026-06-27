@@ -1,4 +1,4 @@
-# System Monitor v0.3.1 — Bale + Telegram Bot
+# System Monitor v0.3.2 — Bale + Telegram Bot
 
 > Monitor CPU temperature, usage, RAM, GPU, run terminal, take screenshots, control volume, lock screen, and more — from Bale and Telegram.
 
