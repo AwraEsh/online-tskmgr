@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Monitor v0.3.1 | Bale + Telegram
+|System Monitor v0.3.2 | Bale + Telegram
 - Full system monitor + live terminal (pty)
 - Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
 - Buttons: all commands + power with confirmation + restart service
@@ -30,7 +30,7 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v0.3.1")
+log = logging.getLogger("sysmon-v0.3.2")
 
 RUNNING = True
 BALE_OFFSET = 0
@@ -116,12 +116,19 @@ def get_cpu_stats():
         with open("/proc/stat") as f:
             parts = f.readline().strip().split()
         fields = [int(x) for x in parts[1:]]
+        # Use ALL fields for total (user + nice + system + idle + iowait + irq + softirq + steal)
         u, n, s, i = fields[0], fields[1], fields[2], fields[3]
-        t = u + n + s + i
+        iowait = fields[4] if len(fields) > 4 else 0
+        irq = fields[5] if len(fields) > 5 else 0
+        sirq = fields[6] if len(fields) > 6 else 0
+        steal = fields[7] if len(fields) > 7 else 0
+        t = sum(fields)  # total = all fields
         pct = 0.0
         if PREV_TOTAL is not None:
             dtot, didle = t - PREV_TOTAL, i - PREV_IDLE
-            if dtot > 0: pct = round(min((1 - didle/dtot)*100, 100), 1)
+            if dtot > 0:
+                pct = round((1 - didle/dtot)*100, 1)
+                pct = max(0, min(100, pct))
         PREV_TOTAL, PREV_IDLE = t, i
         cores = sum(1 for _ in open("/proc/cpuinfo") if _.startswith("processor"))
         lo = open("/proc/loadavg").read().strip().split()
@@ -445,20 +452,32 @@ def delete_msg(platform, msg_id):
 
 
 def _safe_edit(platform, chat_id, msg_id, text, keyboard):
-    """Try to edit existing message. If it fails, send a new one and return the new msg_id."""
+    """Try to edit existing message text. If it fails, send a new one and return the new msg_id.
+    
+    Strategy: edit text WITHOUT reply_markup first (some platforms reject
+    editMessageText when a keyboard is attached), then update keyboard separately
+    via editMessageReplyMarkup.
+    """
     base = BALE_API if platform == "bale" else TG_API
+    
+    # Step 1: edit text only (no keyboard)
     r = api_call(base, "editMessageText", {
         "chat_id": chat_id, "message_id": msg_id,
-        "text": text, "parse_mode": "Markdown",
-        "reply_markup": keyboard})
+        "text": text, "parse_mode": "Markdown"})
+    if not r or not r.get("ok"):
+        # Try without Markdown
+        r = api_call(base, "editMessageText", {
+            "chat_id": chat_id, "message_id": msg_id,
+            "text": text})
+    
     if r and r.get("ok"):
+        # Step 2: update keyboard separately
+        if keyboard:
+            api_call(base, "editMessageReplyMarkup", {
+                "chat_id": chat_id, "message_id": msg_id,
+                "reply_markup": keyboard})
         return msg_id
-    # Edit failed — try without Markdown
-    r = api_call(base, "editMessageText", {
-        "chat_id": chat_id, "message_id": msg_id,
-        "text": text, "reply_markup": keyboard})
-    if r and r.get("ok"):
-        return msg_id
+    
     # Edit completely failed — send new message
     r = api_call(base, "sendMessage", {
         "chat_id": chat_id, "text": text,
@@ -949,7 +968,6 @@ def main():
     global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID, THRESHOLD_WAIT
 
     temp = get_cpu_temp()
-    cpu = get_cpu_stats()
     cpu = get_cpu_stats()
     ram, gpu, procs, up = get_ram(), get_gpu(), get_procs(), get_up()
 
