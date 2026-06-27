@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-|System Monitor v0.3.2 | Bale + Telegram
+|System Monitor v0.3.3 | Bale + Telegram
 - Full system monitor + live terminal (pty)
 - Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
 - Buttons: all commands + power with confirmation + restart service
@@ -30,7 +30,7 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v0.3.2")
+log = logging.getLogger("sysmon-v0.3.3")
 
 RUNNING = True
 BALE_OFFSET = 0
@@ -175,15 +175,23 @@ def get_gpu():
     return info
 
 
-def get_procs(limit=7):
+def get_procs(limit=5):
+    """Return top processes by CPU and by memory usage."""
+    result = {"cpu": [], "mem": []}
     try:
-        out = subprocess.check_output(["ps", "aux", "--sort=-%cpu"], timeout=3).decode(errors="replace")
         procs = []
-        for l in out.strip().split("\n")[1:limit+1]:
+        out = subprocess.check_output(["ps", "aux"], timeout=3).decode(errors="replace")
+        for l in out.strip().split("\n")[1:]:
             p = l.split(None, 10)
-            if len(p) >= 11: procs.append({"c": p[2], "m": p[3], "r": p[5], "cmd": p[10][:35]})
-        return procs
-    except: return []
+            if len(p) >= 11:
+                procs.append({"c": p[2], "m": p[3], "r": p[5], "cmd": p[10][:35]})
+        # Sort by CPU
+        result["cpu"] = sorted(procs, key=lambda x: float(x["c"]), reverse=True)[:limit]
+        # Sort by RSS (memory)
+        result["mem"] = sorted(procs, key=lambda x: int(x["r"]) if x["r"].isdigit() else 0, reverse=True)[:limit]
+    except:
+        pass
+    return result
 
 
 def get_up():
@@ -258,10 +266,18 @@ def build_text(temp, cpu, ram, gpu, procs, up, update_time="", is_bale=False):
         L.append(gl)
 
     # Processes
-    if procs:
+    if (procs.get("cpu") if isinstance(procs, dict) else None):
         L.append("")
-        L.append("Top Processes")
-        for i, p in enumerate(procs, 1):
+        L.append("Top CPU")
+        for i, p in enumerate(procs["cpu"], 1):
+            rss = round(int(p['r'])/1024, 1) if p['r'].isdigit() else "?"
+            cmd_short = p['cmd'][:30]
+            L.append(f"  {i}. {cmd_short}")
+            L.append(f"     CPU {_md(p['c'] + '%', is_bale)}  MEM {_md(p['m'] + '%', is_bale)} ({rss}MB)")
+    if (procs.get("mem") if isinstance(procs, dict) else None):
+        L.append("")
+        L.append("Top MEM")
+        for i, p in enumerate(procs["mem"], 1):
             rss = round(int(p['r'])/1024, 1) if p['r'].isdigit() else "?"
             cmd_short = p['cmd'][:30]
             L.append(f"  {i}. {cmd_short}")
@@ -452,33 +468,43 @@ def delete_msg(platform, msg_id):
 
 
 def _safe_edit(platform, chat_id, msg_id, text, keyboard):
-    """Try to edit existing message text. If it fails, send a new one and return the new msg_id.
+    """Try to edit existing message. If it fails, send a new one and return the new msg_id.
     
-    Strategy: edit text WITHOUT reply_markup first (some platforms reject
-    editMessageText when a keyboard is attached), then update keyboard separately
-    via editMessageReplyMarkup.
+    Strategy:
+    1. Try editMessageText WITH reply_markup (atomic — no flicker, works on Telegram).
+    2. If that fails, try WITHOUT reply_markup + Markdown (Bale-compatible text edit).
+    3. If text edit succeeded, set keyboard separately via editMessageReplyMarkup.
+    4. If all fails, send a new message.
     """
     base = BALE_API if platform == "bale" else TG_API
-    
-    # Step 1: edit text only (no keyboard)
+
+    # Step 1: try atomic edit (text + keyboard together — Telegram)
+    r = api_call(base, "editMessageText", {
+        "chat_id": chat_id, "message_id": msg_id,
+        "text": text, "parse_mode": "Markdown",
+        "reply_markup": keyboard})
+    if r and r.get("ok"):
+        return msg_id
+
+    # Step 2: failed — try text-only (no keyboard, works on Bale)
     r = api_call(base, "editMessageText", {
         "chat_id": chat_id, "message_id": msg_id,
         "text": text, "parse_mode": "Markdown"})
     if not r or not r.get("ok"):
-        # Try without Markdown
+        # Try without Markdown too
         r = api_call(base, "editMessageText", {
             "chat_id": chat_id, "message_id": msg_id,
             "text": text})
-    
+
     if r and r.get("ok"):
-        # Step 2: update keyboard separately
+        # Text edit worked — set keyboard separately
         if keyboard:
             api_call(base, "editMessageReplyMarkup", {
                 "chat_id": chat_id, "message_id": msg_id,
                 "reply_markup": keyboard})
         return msg_id
-    
-    # Edit completely failed — send new message
+
+    # Step 4: completely failed — send new message
     r = api_call(base, "sendMessage", {
         "chat_id": chat_id, "text": text,
         "parse_mode": "Markdown", "reply_markup": keyboard})
