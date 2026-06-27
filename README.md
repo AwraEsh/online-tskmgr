@@ -1,4 +1,4 @@
-# System Monitor v0.2 — Bale + Telegram Bot
+# System Monitor v0.3 — Bale + Telegram Bot
 
 > Monitor CPU temperature, usage, RAM, GPU, run terminal, take screenshots, control volume, lock screen, and more — from Bale and Telegram.
 
@@ -23,7 +23,10 @@
 - **AnyDesk** remote launch
 - **Power options**: Reboot, Shutdown, Sleep (with confirmation)
 - **Restart Bot**: Restart the bot service from chat
-- **Thermal alerts**: Separate alert message when CPU/GPU exceeds 90C, auto-deleted when cooled down
+- **Thermal alerts**: Separate alert message when CPU/GPU exceeds threshold, auto-deleted when cooled down
+- **Changeable threshold**: Button to change thermal alert threshold (0-110C) from chat, with 1-minute timeout and cancel
+- **Reset threshold**: "Reset 90C" button instantly restores the default 90C threshold
+- **Smart suppression**: Thermal alerts pause while threshold input is pending to avoid flooding the chat
 
 ---
 
@@ -119,8 +122,8 @@ TG_CHAT_ID=your_telegram_chat_id
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALERT_THRESHOLD` | 90C | Temperature threshold for thermal alerts |
-| `INTERVAL_NORMAL` | 3s | Fixed update interval (always 3s) |
+| `ALERT_THRESHOLD` | 90C | Temperature threshold for thermal alerts (changeable from .env or via bot button) |
+| `INTERVAL_NORMAL` | 3s | Stats update interval |
 
 ---
 
@@ -140,6 +143,7 @@ TG_CHAT_ID=your_telegram_chat_id
 | `/ad` | Launch AnyDesk |
 | `/lock` | Lock screen |
 | `/restart` | Restart bot service |
+| `/cancel` | Cancel pending threshold input |
 
 ---
 

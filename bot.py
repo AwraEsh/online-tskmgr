@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Monitor v0.2 | Bale + Telegram
+System Monitor v0.3 | Bale + Telegram
 - Full system monitor + live terminal (pty)
 - Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
 - Buttons: all commands + power with confirmation + restart service
@@ -18,7 +18,7 @@ BALE_CHAT   = os.environ.get("BALE_CHAT_ID", "0")
 TG_TOKEN    = os.environ.get("TG_BOT_TOKEN", "0")
 TG_CHAT     = os.environ.get("TG_CHAT_ID", "0")
 
-ALERT_THRESHOLD = 90
+ALERT_THRESHOLD = int(os.environ.get("ALERT_THRESHOLD", "90"))
 INTERVAL_NORMAL = 3
 # ====================
 
@@ -30,7 +30,7 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v0.2")
+log = logging.getLogger("sysmon-v0.3")
 
 RUNNING = True
 BALE_OFFSET = 0
@@ -39,6 +39,7 @@ PREV_TOTAL = None
 PREV_IDLE  = None
 ALERT_BALE_MID = None  # message id of last thermal alert on Bale
 ALERT_TG_MID   = None  # message id of last thermal alert on Telegram
+THRESHOLD_WAIT = None  # {"platform": str, "msg_id": int, "time": float}
 
 signal.signal(signal.SIGTERM, lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
 signal.signal(signal.SIGINT,  lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
@@ -52,7 +53,7 @@ def api_call(base, method, payload, retries=3):
         try:
             req = Request(f"{base}{method}", data=data,
                           headers={"Content-Type": "application/json"})
-            with urlopen(req, timeout=15) as r:
+            with urlopen(req, timeout=7) as r:
                 return json.loads(r.read())
         except URLError as e:
             if attempt < retries - 1:
@@ -397,6 +398,10 @@ def kb(mode="stats"):
                 {"text": "Vol 100%", "callback_data": "vol_100"},
             ],
             [
+                {"text": "Change Threshold", "callback_data": "change_threshold"},
+                {"text": "Reset 90C", "callback_data": "reset_threshold"},
+            ],
+            [
                 {"text": "Restart Bot", "callback_data": "restart_svc"},
             ],
             [
@@ -409,16 +414,19 @@ def kb(mode="stats"):
 
 
 def edit_both(text, keyboard, bale_mid, tg_mid):
+    threads = []
     if bale_mid:
-        bale("editMessageText", {
+        threads.append(threading.Thread(target=lambda: bale("editMessageText", {
             "chat_id": BALE_CHAT, "message_id": bale_mid,
             "text": text, "parse_mode": "Markdown",
-            "reply_markup": keyboard})
+            "reply_markup": keyboard})))
     if tg_mid:
-        tg("editMessageText", {
+        threads.append(threading.Thread(target=lambda: tg("editMessageText", {
             "chat_id": TG_CHAT, "message_id": tg_mid,
             "text": text, "parse_mode": "Markdown",
-            "reply_markup": keyboard})
+            "reply_markup": keyboard})))
+    for t in threads: t.start()
+    for t in threads: t.join()
 
 
 def send_text(platform, text):
@@ -519,14 +527,39 @@ def cmd_restart_service():
 # ─── Command handler ───
 
 def handle_command(platform, text, chat_id):
+    global ALERT_THRESHOLD, THRESHOLD_WAIT
     text = text.strip()
 
+    # Threshold input mode: intercept non-command messages
+    if THRESHOLD_WAIT and THRESHOLD_WAIT["platform"] == platform:
+        if not text.startswith("/"):
+            try:
+                val = int(text)
+                if 0 <= val <= 110:
+                    old = ALERT_THRESHOLD
+                    ALERT_THRESHOLD = val
+                    delete_msg(platform, THRESHOLD_WAIT["msg_id"])
+                    THRESHOLD_WAIT = None
+                    return ("text", f"Thermal threshold changed: {old}C -> {val}C")
+                else:
+                    return ("text", "Value must be between 0 and 110.")
+            except ValueError:
+                return ("text", "Please enter a valid number (0-110) or /cancel to abort.")
+
+    if text == "/cancel":
+        if THRESHOLD_WAIT:
+            delete_msg(platform, THRESHOLD_WAIT["msg_id"])
+            THRESHOLD_WAIT = None
+            return ("text", "Cancelled.")
+        return ("text", "Nothing to cancel.")
+
     if text == "/start":
-        return ("text", "System Monitor v0.2 is running.\n\n"
+        return ("text", "System Monitor v0.3 is running.\n\n"
                 "/term - Live terminal\n"
                 "/notif <text> - Desktop notification\n"
                 "/vol <0-100> - Set volume\n"
-                "/restart - Restart bot service\n\n"
+                "/restart - Restart bot service\n"
+                "/cancel - Cancel pending action\n\n"
                 "More buttons below.")
 
     # Terminal
@@ -561,6 +594,7 @@ def handle_command(platform, text, chat_id):
 
 def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
     """Returns (new_mode, alt_text, delete_confirm_id)"""
+    global THRESHOLD_WAIT, ALERT_THRESHOLD
     plat_chat = BALE_CHAT if platform == "bale" else TG_CHAT
 
     if str(from_id) != str(plat_chat):
@@ -691,6 +725,45 @@ def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
         send_cmd_response(platform, ("text", txt))
         return None, None, None
 
+    # Change threshold
+    if data == "change_threshold":
+        ack("Setting threshold...")
+        plat_chat = BALE_CHAT if platform == "bale" else TG_CHAT
+        r = api_call(BALE_API if platform == "bale" else TG_API,
+                     "sendMessage", {
+                         "chat_id": plat_chat,
+                         "text": f"Current thermal threshold: {ALERT_THRESHOLD}C\n\nEnter new threshold (0-110):",
+                         "parse_mode": "Markdown",
+                         "reply_markup": {"inline_keyboard": [[
+                             {"text": "Cancel", "callback_data": "cancel_threshold"},
+                         ]]}})
+        if r and r.get("ok"):
+            THRESHOLD_WAIT = {
+                "platform": platform,
+                "msg_id": r["result"]["message_id"],
+                "time": time.time()
+            }
+        return None, None, None
+
+    if data == "cancel_threshold":
+        ack("Cancelled.")
+        if THRESHOLD_WAIT:
+            delete_msg(THRESHOLD_WAIT["platform"], THRESHOLD_WAIT["msg_id"])
+            THRESHOLD_WAIT = None
+        if cq_msg_id:
+            delete_msg(platform, cq_msg_id)
+        return "stats", None, None
+
+    if data == "reset_threshold":
+        old = ALERT_THRESHOLD
+        ALERT_THRESHOLD = 90
+        # Cancel any pending threshold input
+        if THRESHOLD_WAIT:
+            delete_msg(THRESHOLD_WAIT["platform"], THRESHOLD_WAIT["msg_id"])
+            THRESHOLD_WAIT = None
+        ack(f"Threshold reset: {old}C -> 90C")
+        return None, None, None
+
     return None, None, None
 
 
@@ -785,6 +858,10 @@ def _handle_thermal_alerts(cpu_temp, gpu_info):
     """Check temps every cycle. Send alert if hot, delete if cooled down."""
     global ALERT_BALE_MID, ALERT_TG_MID
 
+    # Suppress thermal alerts while user is changing threshold
+    if THRESHOLD_WAIT is not None:
+        return
+
     hot_parts = []
     if cpu_temp is not None and cpu_temp >= ALERT_THRESHOLD:
         hot_parts.append(("CPU", cpu_temp))
@@ -804,14 +881,23 @@ def _handle_thermal_alerts(cpu_temp, gpu_info):
         # delete old alert first
         _delete_alerts()
 
-        # send new alert to both platforms
-        r_bale = bale("sendMessage", {"chat_id": BALE_CHAT, "text": alert_text, "parse_mode": "Markdown"})
-        if r_bale and r_bale.get("ok"):
-            ALERT_BALE_MID = r_bale["result"]["message_id"]
+        # send new alert to both platforms (parallel)
+        def _send_bale_alert():
+            global ALERT_BALE_MID
+            r = bale("sendMessage", {"chat_id": BALE_CHAT, "text": alert_text, "parse_mode": "Markdown"})
+            if r and r.get("ok"):
+                ALERT_BALE_MID = r["result"]["message_id"]
 
-        r_tg = tg("sendMessage", {"chat_id": TG_CHAT, "text": alert_text, "parse_mode": "Markdown"})
-        if r_tg and r_tg.get("ok"):
-            ALERT_TG_MID = r_tg["result"]["message_id"]
+        def _send_tg_alert():
+            global ALERT_TG_MID
+            r = tg("sendMessage", {"chat_id": TG_CHAT, "text": alert_text, "parse_mode": "Markdown"})
+            if r and r.get("ok"):
+                ALERT_TG_MID = r["result"]["message_id"]
+
+        t1 = threading.Thread(target=_send_bale_alert)
+        t2 = threading.Thread(target=_send_tg_alert)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
 
         log.warning(f"Thermal alert sent: {hot_parts}")
     else:
@@ -853,8 +939,8 @@ def main():
         now  = time.time()
         temp = get_cpu_temp()
 
-        # Poll every 5 seconds
-        if now - last_poll >= 5:
+        # Poll every 2 seconds
+        if now - last_poll >= 2:
             # Bale
             BALE_OFFSET, bm, ba, bcmds, _ = poll_platform("bale", BALE_OFFSET)
             if bm:
@@ -887,17 +973,20 @@ def main():
                 bale_text = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=True)
                 tg_text   = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=False)
 
-                # Edit each platform with its own formatting
+                # Edit each platform with its own formatting (parallel)
+                edit_threads = []
                 if BALE_MID:
-                    bale("editMessageText", {
+                    edit_threads.append(threading.Thread(target=lambda: bale("editMessageText", {
                         "chat_id": BALE_CHAT, "message_id": BALE_MID,
                         "text": bale_text, "parse_mode": "Markdown",
-                        "reply_markup": kb("stats")})
+                        "reply_markup": kb("stats")})))
                 if TG_MID:
-                    tg("editMessageText", {
+                    edit_threads.append(threading.Thread(target=lambda: tg("editMessageText", {
                         "chat_id": TG_CHAT, "message_id": TG_MID,
                         "text": tg_text, "parse_mode": "Markdown",
-                        "reply_markup": kb("stats")})
+                        "reply_markup": kb("stats")})))
+                for t in edit_threads: t.start()
+                for t in edit_threads: t.join()
 
                 last_stats = now
 
@@ -906,10 +995,17 @@ def main():
                 _handle_thermal_alerts(temp, gpu_info)
 
                 log.info(f"{temp:.1f}C | 3s interval")
+
+        # Threshold timeout (1 minute)
+        if THRESHOLD_WAIT and now - THRESHOLD_WAIT["time"] > 60:
+            delete_msg(THRESHOLD_WAIT["platform"], THRESHOLD_WAIT["msg_id"])
+            THRESHOLD_WAIT = None
+            log.info("Threshold input timed out")
+
         elif mode in ("executing", "confirm"):
             time.sleep(5)
 
-        time.sleep(0.5)
+        time.sleep(0.15)
 
     # Clean shutdown
     edit_both("Bot stopped.", {"inline_keyboard": []}, BALE_MID, TG_MID)
