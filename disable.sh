@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================
-# System Monitor v5 — Service Disabler & Cleanup
+# System Monitor v0.2 — Service Disabler & Cleanup
 # ==============================================================
 # Stops the bot service, disables auto-start, and optionally
 # removes the service file completely.

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-System Monitor v5 🔥🤖🎮💻 | Bale + Telegram
-- مانیتور کامل سیستم + ترمینال زنده (pty)
-- کامند: /term /ad /lock /notif /cam /ss /ip /wifi /vol /bye
-- دکمه: همه کامندها + پاور با تأیید مجزا
+System Monitor v0.2 | Bale + Telegram
+- Full system monitor + live terminal (pty)
+- Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
+- Buttons: all commands + power with confirmation + restart service
 """
 
 import os, sys, time, json, glob, logging, signal, subprocess, uuid, io, pty, select, termios, struct, fcntl, errno
 from urllib.request import Request, urlopen
 from urllib.error import URLError
-import threading
+import threading, re
 
-# ====== کانفیگ ======
+# ====== Config ======
 BALE_TOKEN  = os.environ.get("BALE_BOT_TOKEN", "0")
 BALE_CHAT   = os.environ.get("BALE_CHAT_ID", "0")
 
@@ -19,26 +19,26 @@ TG_TOKEN    = os.environ.get("TG_BOT_TOKEN", "0")
 TG_CHAT     = os.environ.get("TG_CHAT_ID", "0")
 
 ALERT_THRESHOLD = 90
-INTERVAL_NORMAL = 2
-HOT_SKIP_RATE   = 5
+INTERVAL_NORMAL = 3
 # ====================
 
 if not BALE_TOKEN or not BALE_CHAT or not TG_TOKEN or not TG_CHAT:
-    print("❌ یکی از متغیرهای محیطی کمه!")
+    print("[FATAL] Missing environment variables. Check .env file.")
     sys.exit(1)
 
 BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v5")
+log = logging.getLogger("sysmon-v0.2")
 
 RUNNING = True
 BALE_OFFSET = 0
 TG_OFFSET   = 0
 PREV_TOTAL = None
 PREV_IDLE  = None
-HOT_TICK   = 0
+ALERT_BALE_MID = None  # message id of last thermal alert on Bale
+ALERT_TG_MID   = None  # message id of last thermal alert on Telegram
 
 signal.signal(signal.SIGTERM, lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
 signal.signal(signal.SIGINT,  lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
@@ -69,7 +69,7 @@ def tg(method, payload):
     return api_call(TG_API, method, payload)
 
 
-# ─── آپلود عکس ───
+# ─── Photo upload ───
 
 def send_photo(base, chat_id, file_path, caption=""):
     try:
@@ -98,7 +98,7 @@ def send_photo(base, chat_id, file_path, caption=""):
         return None
 
 
-# ─── جمع‌آوری آمار ───
+# ─── Stats collection ───
 
 def get_cpu_temp():
     try:
@@ -186,64 +186,82 @@ def get_up():
     except: return "?"
 
 
-# ─── ویجت‌ها ───
+# ─── Widgets ───
 
-def _bar(p, w=10, fill="▓", empty="░"):
+def _bar(p, w=10, fill="\u2593", empty="\u2591"):
     f = round(min(p,100)/100*w)
-    return f"`{fill*f}{empty*(w-f)}`"
+    return f"{fill*f}{empty*(w-f)}"
+
 
 def _now_ts():
     return time.strftime("%H:%M:%S")
 
 
 def _thermometer(temp, width=12):
-    if temp is None: return "`[░░░░░░░░░░░░]` ?°C"
+    if temp is None: return f"[{'?'*width}] ?C"
     f = round(min(temp, 100) / 100 * width)
     f = max(0, min(width, f))
-    icon = "🔥" if temp >= 90 else "🔴" if temp >= 75 else "🟠" if temp >= 60 else "🟡" if temp >= 45 else "🟢"
-    return f"{icon}`[{'█'*f}{'░'*(width-f)}]` {temp:.1f}°C"
+    return f"[{'#'*f}{'.'*(width-f)}] {temp:.1f}C"
 
 
-def build_text(temp, cpu, ram, gpu, procs, up, is_hot, skip_info="", update_time=""):
-    L, sep = [], "▬▬▬▬▬▬▬▬▬▬▬▬▬"
-    if cpu: L.append(f"💻 **System Monitor** · {cpu['cores']}C")
-    else:   L.append("💻 **System Monitor**")
-    L.append(f"⏱ `{up}` {skip_info}")
+def _md(text, is_bale):
+    """Wrap text in backticks for Telegram, plain for Bale."""
+    if is_bale:
+        return text
+    return f"`{text}`"
+
+
+def build_text(temp, cpu, ram, gpu, procs, up, update_time="", is_bale=False):
+    L, sep = [], "---------------"
+    if cpu: L.append(f"System Monitor | {cpu['cores']}C")
+    else:   L.append("System Monitor")
+    uptime_line = f"Uptime: {up}"
     if update_time:
-        L[-1] += f" 🕐 `{update_time}`"
+        uptime_line += f"  |  {update_time}"
+    L.append(uptime_line)
     L.append(sep)
-    tl = "🖥 **CPU**"
-    if temp is not None: tl += f" {_thermometer(temp)}"
+
+    # CPU
+    tl = "CPU"
+    if temp is not None:
+        tl += f"  {_thermometer(temp)}"
     if cpu:
-        tl += f"\n   ⚡ `{cpu['pct']}%` {_bar(int(cpu['pct']))}"
-        tl += f"\n   📊 Load: `{cpu['l1']} / {cpu['l5']} / {cpu['l15']}`"
-    L.append(tl); L.append("")
+        tl += f"\n  Usage: {_md(str(cpu['pct']) + '%', is_bale)} {_bar(int(cpu['pct']))}"
+        tl += f"\n  Load: {_md(cpu['l1'] + ' / ' + cpu['l5'] + ' / ' + cpu['l15'], is_bale)}"
+    L.append(tl)
+    L.append("")
+
+    # RAM
     if ram:
-        ri = "🔴" if ram['pct'] > 80 else "🟠" if ram['pct'] > 60 else "🟢"
-        L.append(f"💾 **RAM** {ri} `{ram['u']}/{ram['t']}GB` · `{ram['pct']}%` {_bar(int(ram['pct']))}")
+        L.append(f"RAM  {_md(str(ram['u']) + '/' + str(ram['t']) + 'GB', is_bale)}  {_md(str(ram['pct']) + '%', is_bale)} {_bar(int(ram['pct']))}")
         if ram['st'] > 0:
             sp = round(ram['su']/ram['st']*100) if ram['st'] else 0
-            L.append(f"   💿 Swap: `{ram['su']}/{ram['st']}GB` · `{sp}%` {_bar(sp)}")
+            L.append(f"  Swap: {_md(str(ram['su']) + '/' + str(ram['st']) + 'GB', is_bale)}  {_md(str(sp) + '%', is_bale)} {_bar(sp)}")
     L.append("")
+
+    # GPU
     if gpu.get('n') or gpu.get('t') is not None:
-        gl = "🎮 **GPU"
+        gl = "GPU"
         if gpu.get('n'): gl += f" ({gpu['n'].upper()})"
-        gl += "**"
         items = []
-        if gpu['t'] is not None: items.append(f"🌡{gpu['t']:.0f}°C")
-        if gpu['u'] is not None: items.append(f"⚡{gpu['u']:.0f}%")
-        if items: gl += " · " + " ".join(items)
+        if gpu['t'] is not None: items.append(f"{gpu['t']:.0f}C")
+        if gpu['u'] is not None: items.append(f"{gpu['u']:.0f}%")
+        if items: gl += "  " + _md(" | ".join(items), is_bale)
         L.append(gl)
+
+    # Processes
     if procs:
-        L.append(""); L.append("📌 **Top Processes**")
+        L.append("")
+        L.append("Top Processes")
         for i, p in enumerate(procs, 1):
             rss = round(int(p['r'])/1024, 1) if p['r'].isdigit() else "?"
-            L.append(f"  `{i}.` `{p['cmd']}`")
-            L.append(f"      ⚡`{p['c']}%`  💾`{p['m']}%` ({rss}MB)")
+            cmd_short = p['cmd'][:30]
+            L.append(f"  {i}. {cmd_short}")
+            L.append(f"     CPU {_md(p['c'] + '%', is_bale)}  MEM {_md(p['m'] + '%', is_bale)} ({rss}MB)")
     return "\n".join(L)
 
 
-# ─── ترمینال زنده با PTY ───
+# ─── Live Terminal (PTY) ───
 
 TERMINAL_PROC = None  # subprocess
 TERMINAL_PID  = None  # pty child pid
@@ -255,54 +273,46 @@ TERM_SHELL = "bash"
 TERM_ARGS  = ["--norc", "--noprofile"]
 
 def term_start(platform):
-    """یه ترمینال جدید با pty بزن (bash ساده، بدون ANSI)"""
     global TERMINAL_PROC, TERMINAL_PID, TERMINAL_FD, TERMINAL_BUF, TERMINAL_PLATFORM, TERMINAL_TICK
 
     if TERMINAL_FD is not None:
-        return "⚠️ یه ترمینال از قبل بازه. اول `/bye` کن بعد دوباره باز کن."
+        return "A terminal is already open. Use /bye first to close it."
 
     try:
         pid, fd = pty.fork()
         if pid == 0:
-            # child process - bash خام
             os.environ["TERM"] = "dumb"
             os.environ["PS1"] = "> "
             os.execle("/bin/bash", "-bash", "--norc", "--noprofile", os.environ)
             os._exit(1)
 
-        # parent
         TERMINAL_PID = pid
         TERMINAL_FD = fd
         TERMINAL_BUF = ""
         TERMINAL_PLATFORM = platform
         TERMINAL_TICK = 0
 
-        # make fd non-blocking
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-        # receive initial prompt
         time.sleep(0.5)
-        out = ""
         try:
             out = os.read(fd, 4096).decode(errors="replace")
         except:
             pass
 
-        # no initial read - just send welcome, first command fetches real output
-        return "💻 **Terminal** (bash)\nبه شل متصل شدی. هر دستوری بزن برات اجرا میکنم.\n`/bye` برای خروج."
+        return "Terminal (bash)\nConnected to shell. Send any command to execute.\n/bye to exit."
 
     except Exception as e:
         log.error(f"term_start: {e}")
-        return f"❌ خطا: {e}"
+        return f"Error: {e}"
 
 
 def term_send(text):
-    """دستور بفرست به ترمینال"""
     global TERMINAL_FD, TERMINAL_BUF, TERMINAL_PID
 
     if TERMINAL_FD is None:
-        return "⚠️ ترمینالی باز نیست. `/term` بزن."
+        return "No terminal open. Use /term to start one."
 
     if text.strip() == "/bye":
         return term_stop()
@@ -326,23 +336,20 @@ def term_send(text):
         if len(TERMINAL_BUF) > 5000:
             TERMINAL_BUF = TERMINAL_BUF[-3000:]
 
-        # strip ANSI
-        import re
-        display = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*[^\x07]*\x07|\x1b[^\[].', '', TERMINAL_BUF[-2000:])
+        display = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*[^\x07]*\x07|\x1b[^\\[].', '', TERMINAL_BUF[-2000:])
         display = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', display).strip()
-        return f"💻 **Terminal**\n\n`{display[:2000]}`"
+        return f"Terminal\n\n{display[:2000]}"
 
     except Exception as e:
         log.error(f"term_send: {e}")
-        return f"❌ خطا: {e}"
+        return f"Error: {e}"
 
 
 def term_stop():
-    """ترمینال رو بکش و ببند"""
     global TERMINAL_FD, TERMINAL_PID, TERMINAL_BUF, TERMINAL_PLATFORM
 
     if TERMINAL_FD is None:
-        return "⚠️ ترمینالی باز نیست."
+        return "No terminal open."
 
     try:
         if TERMINAL_PID:
@@ -360,41 +367,42 @@ def term_stop():
     TERMINAL_BUF = ""
     TERMINAL_PLATFORM = None
 
-    return "👋 **ترمینال بسته شد.**"
+    return "Terminal closed."
 
 
 def term_is_active():
     return TERMINAL_FD is not None
 
 
-# ─── کیبورد ───
+# ─── Keyboard ───
 
 def kb(mode="stats"):
     k = {"inline_keyboard": []}
     if mode == "stats":
         k["inline_keyboard"] = [
             [
-                {"text": "🖥 AnyDesk", "callback_data": "ad"},
-                {"text": "🔒 Lock", "callback_data": "lock"},
+                {"text": "AnyDesk", "callback_data": "ad"},
+                {"text": "Lock", "callback_data": "lock"},
             ],
             [
-                {"text": "📸 Webcam", "callback_data": "cam"},
-                {"text": "🖼 SS", "callback_data": "ss"},
+                {"text": "Webcam", "callback_data": "cam"},
+                {"text": "Screenshot", "callback_data": "ss"},
             ],
             [
-                {"text": "🌐 IP", "callback_data": "ip"},
-                {"text": "📶 WiFi", "callback_data": "wifi"},
+                {"text": "IP", "callback_data": "ip"},
+                {"text": "WiFi", "callback_data": "wifi"},
             ],
             [
-                {"text": "🔊 25", "callback_data": "vol_25"},
-                {"text": "🔊 50", "callback_data": "vol_50"},
-                {"text": "🔊 75", "callback_data": "vol_75"},
-                {"text": "🔊 100", "callback_data": "vol_100"},
+                {"text": "Vol 0%", "callback_data": "vol_0"},
+                {"text": "Vol 100%", "callback_data": "vol_100"},
             ],
             [
-                {"text": "🔄 ریستارت", "callback_data": "reboot"},
-                {"text": "⏻ خاموش", "callback_data": "shutdown"},
-                {"text": "💤 خواب", "callback_data": "sleep"},
+                {"text": "Restart Bot", "callback_data": "restart_svc"},
+            ],
+            [
+                {"text": "Reboot", "callback_data": "reboot"},
+                {"text": "Shutdown", "callback_data": "shutdown"},
+                {"text": "Sleep", "callback_data": "sleep"},
             ],
         ]
     return k
@@ -414,7 +422,6 @@ def edit_both(text, keyboard, bale_mid, tg_mid):
 
 
 def send_text(platform, text):
-    """فرستادن یه پیام متنی جدید به پلتفرم مشخص"""
     base = BALE_API if platform == "bale" else TG_API
     chat = BALE_CHAT if platform == "bale" else TG_CHAT
     return api_call(base, "sendMessage", {
@@ -422,29 +429,28 @@ def send_text(platform, text):
 
 
 def delete_msg(platform, msg_id):
-    """پاک کردن یه پیام"""
     base = BALE_API if platform == "bale" else TG_API
     chat = BALE_CHAT if platform == "bale" else TG_CHAT
     return api_call(base, "deleteMessage", {
         "chat_id": chat, "message_id": msg_id})
 
 
-# ─── کامندها ───
+# ─── Commands ───
 
 def cmd_ad():
     for cmd in ["/var/lib/flatpak/exports/bin/com.anydesk.Anydesk", "/usr/bin/anydesk"]:
         if os.path.exists(cmd):
-            subprocess.Popen([cmd]); return "🖥️ **AnyDesk** باز شد!"
+            subprocess.Popen([cmd]); return "AnyDesk launched."
     try:
-        subprocess.Popen(["flatpak", "run", "com.anydesk.Anydesk"]); return "🖥️ **AnyDesk** باز شد!"
-    except: return "❌ AnyDesk روی سیستم نصب نیست."
+        subprocess.Popen(["flatpak", "run", "com.anydesk.Anydesk"]); return "AnyDesk launched."
+    except: return "AnyDesk is not installed."
 
 def cmd_lock():
-    subprocess.run(["loginctl", "lock-sessions"], timeout=5); return "🔒 **صفحه قفل شد!**"
+    subprocess.run(["loginctl", "lock-sessions"], timeout=5); return "Screen locked."
 
 def cmd_notif(text):
-    if not text.strip(): return "ℹ️ `متن نوتیفیکیشن رو وارد کن`\nمثال: `/notif سلام`"
-    subprocess.run(["notify-send", "🖥 System Monitor", text], timeout=5); return "✅ **نوتیفیکیشن** فرستاده شد."
+    if not text.strip(): return "Usage: /notif <message>"
+    subprocess.run(["notify-send", "System Monitor", text], timeout=5); return "Notification sent."
 
 def cmd_cam():
     path = "/tmp/bot_webcam.jpg"
@@ -452,9 +458,9 @@ def cmd_cam():
         subprocess.run(["ffmpeg", "-f", "v4l2", "-video_size", "640x480", "-i", "/dev/video0",
             "-frames:v", "1", "-q:v", "5", "-y", path], timeout=10, capture_output=True)
         if os.path.exists(path) and os.path.getsize(path) > 1000:
-            return ("PHOTO", path, "📸 **وبکم**")
-        return "❌ وبکم کار نکرد."
-    except Exception as e: return f"❌ خطا: {e}"
+            return ("PHOTO", path, "Webcam")
+        return "Webcam capture failed."
+    except Exception as e: return f"Error: {e}"
 
 def cmd_ss():
     path = "/tmp/bot_screenshot.jpg"
@@ -466,9 +472,9 @@ def cmd_ss():
         from PIL import Image
         img = Image.frombytes("RGB", (geom.width, geom.height), raw.data, "raw", "BGRX")
         img.save(path, "JPEG", quality=80); d.close()
-        if os.path.exists(path) and os.path.getsize(path) > 100: return ("PHOTO", path, "🖥 **اسکرین‌شات**")
-        return "❌ اسکرین‌شات کار نکرد."
-    except Exception as e: return f"❌ خطا: {e}"
+        if os.path.exists(path) and os.path.getsize(path) > 100: return ("PHOTO", path, "Screenshot")
+        return "Screenshot failed."
+    except Exception as e: return f"Error: {e}"
 
 def cmd_ip():
     private = "?"
@@ -477,55 +483,65 @@ def cmd_ip():
     public = "?"
     try: public = urlopen(Request("https://api.ipify.org"), timeout=5).read().decode().strip()
     except: pass
-    return f"🌐 **IP Address**\n▬▬▬▬▬▬▬▬▬▬▬▬▬\n🏠 **پرایوت:**\n`{private}`\n\n🌍 **پابلیک:**\n`{public}`"
+    return f"IP Address\n---------------\nPrivate:\n{private}\n\nPublic:\n{public}"
 
 def cmd_wifi():
     try:
         out = subprocess.check_output(["nmcli", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"], timeout=10).decode(errors="replace").strip()
         lines = out.split("\n")
-        if len(lines) <= 1: return "📶 وای‌فای‌ای پیدا نشد."
-        result = ["📶 **WiFi Networks**", "▬▬▬▬▬▬▬▬▬▬▬▬▬"]
+        if len(lines) <= 1: return "No WiFi networks found."
+        result = ["WiFi Networks", "---------------"]
         for line in lines[1:]:
             parts = line.split(None, 2)
             if len(parts) >= 2:
                 bars = int(parts[1])//20 if parts[1].isdigit() else 0
-                result.append(f"`{parts[0][:25]:25}` {'▂▄▆█'[:bars]+'_'*(4-bars)} {parts[1]}%")
+                result.append(f"{parts[0][:25]:25} {'####'[:bars]+'.'*(4-bars)} {parts[1]}%")
         return "\n".join(result)
-    except: return "❌ خطا"
+    except: return "Error scanning WiFi."
 
 def cmd_vol(level_str):
     try:
         level = max(0, min(100, int(level_str)))
         subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"], timeout=5, stderr=subprocess.DEVNULL)
-        return f"🔊 **صدا** روی `{level}%` تنظیم شد."
-    except: return "ℹ️ عدد وارد کن"
+        return f"Volume set to {level}%."
+    except: return "Invalid number."
 
 
-# ─── پردازش کامند ───
+def cmd_restart_service():
+    """Restart the bale-cpu-alert systemd service."""
+    try:
+        subprocess.run(["systemctl", "--user", "restart", "bale-cpu-alert"], timeout=10)
+        return "Bot service restarting..."
+    except Exception as e:
+        return f"Restart failed: {e}"
+
+
+# ─── Command handler ───
 
 def handle_command(platform, text, chat_id):
     text = text.strip()
 
     if text == "/start":
-        return ("text", "🤖 **System Monitor v5** فعاله!\n"
-                "`/term` ← ترمینال زنده\n"
-                "`/notif <text>` ← نوتیفیکیشن\n"
-                "`/vol <0-100>` ← صدا\n"
-                "بقیه دکمه‌ها تو پنل پایین ⬇️")
+        return ("text", "System Monitor v0.2 is running.\n\n"
+                "/term - Live terminal\n"
+                "/notif <text> - Desktop notification\n"
+                "/vol <0-100> - Set volume\n"
+                "/restart - Restart bot service\n\n"
+                "More buttons below.")
 
-    # ترمینال
+    # Terminal
     if text in ("/term", "/terminal", ".term", ".terminal", "/ter"):
         return ("text", term_start(platform))
 
     if text == "/bye" or text == ".bye":
         if term_is_active():
             return ("text", term_stop())
-        return ("text", "⚠️ ترمینالی باز نیست.")
+        return ("text", "No terminal open.")
 
     if term_is_active():
         return ("text", term_send(text))
 
-    # کامندهای معمولی
+    # Regular commands
     if text in ("/ad", ".ad"): return ("text", cmd_ad())
     if text in ("/lock", ".lock"): return ("text", cmd_lock())
     if text.startswith("/notif "): return ("text", cmd_notif(text[7:]))
@@ -535,21 +551,20 @@ def handle_command(platform, text, chat_id):
     if text in ("/ip", ".ip"): return ("text", cmd_ip())
     if text in ("/wifi", ".wifi"): return ("text", cmd_wifi())
     if text.startswith("/vol "): return ("text", cmd_vol(text[5:]))
+    if text in ("/restart", ".restart"): return ("text", cmd_restart_service())
 
-    if text.startswith("/"): return ("text", f"❌ کامند `{text.split()[0]}` شناخته نشد.\n`/start` برای راهنما")
+    if text.startswith("/"): return ("text", f"Unknown command: {text.split()[0]}\nType /start for help.")
     return None
 
 
-# ─── پردازش کلیک ───
+# ─── Callback handler ───
 
 def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
-    """برگردونه (new_mode, alt_text, delete_confirm_id)
-    delete_confirm_id: اگه پیام تأیید داشت، آیدی اون پیام برای پاک کردن
-    """
+    """Returns (new_mode, alt_text, delete_confirm_id)"""
     plat_chat = BALE_CHAT if platform == "bale" else TG_CHAT
 
     if str(from_id) != str(plat_chat):
-        ans = {"callback_query_id": cq_id, "text": "⛔ نه مال تو"}
+        ans = {"callback_query_id": cq_id, "text": "Access denied."}
         if platform == "bale": bale("answerCallbackQuery", ans)
         else: tg("answerCallbackQuery", ans)
         return None, None, None
@@ -559,85 +574,83 @@ def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
         if platform == "bale": bale("answerCallbackQuery", ans)
         else: tg("answerCallbackQuery", ans)
 
-    # ── دکمه‌های پاور: بجای ادیت پیام موجود، یه پیام تأیید جدید میفرستیم ──
+    # Power buttons: send a new confirmation message
     if data == "reboot":
-        ack("🔘 تأیید ریستارت...")
-        r = send_text(platform, "🔄 **آیا مطمئنی؟**\nکامپیوتر **ریستارت** میشه.")
+        ack("Confirming reboot...")
+        r = send_text(platform, "Are you sure?\nComputer will reboot.")
         if r and r.get("ok"):
             confirm_id = r["result"]["message_id"]
-            # ادیت کنیم دکمه بذاریم
             base = BALE_API if platform == "bale" else TG_API
             chat = BALE_CHAT if platform == "bale" else TG_CHAT
             api_call(base, "editMessageText", {
                 "chat_id": chat, "message_id": confirm_id,
-                "text": "🔄 **آیا مطمئنی؟**\nکامپیوتر **ریستارت** میشه.",
+                "text": "Are you sure?\nComputer will reboot.",
                 "parse_mode": "Markdown",
                 "reply_markup": {"inline_keyboard": [[
-                    {"text": "✅ آره", "callback_data": "do_reboot"},
-                    {"text": "❌ نه", "callback_data": "cancel"},
+                    {"text": "Yes", "callback_data": "do_reboot"},
+                    {"text": "No", "callback_data": "cancel"},
                 ]]}
             })
             return "confirm", None, confirm_id
         return None, None, None
 
     if data == "shutdown":
-        ack("🔘 تأیید خاموشی...")
-        r = send_text(platform, "⏻ **آیا مطمئنی؟**\nکامپیوتر **خاموش** میشه.")
+        ack("Confirming shutdown...")
+        r = send_text(platform, "Are you sure?\nComputer will shut down.")
         if r and r.get("ok"):
             confirm_id = r["result"]["message_id"]
             base = BALE_API if platform == "bale" else TG_API
             chat = BALE_CHAT if platform == "bale" else TG_CHAT
             api_call(base, "editMessageText", {
                 "chat_id": chat, "message_id": confirm_id,
-                "text": "⏻ **آیا مطمئنی؟**\nکامپیوتر **خاموش** میشه.",
+                "text": "Are you sure?\nComputer will shut down.",
                 "parse_mode": "Markdown",
                 "reply_markup": {"inline_keyboard": [[
-                    {"text": "✅ آره", "callback_data": "do_shutdown"},
-                    {"text": "❌ نه", "callback_data": "cancel"},
+                    {"text": "Yes", "callback_data": "do_shutdown"},
+                    {"text": "No", "callback_data": "cancel"},
                 ]]}
             })
             return "confirm", None, confirm_id
         return None, None, None
 
     if data == "sleep":
-        ack("🔘 تأیید خواب...")
-        r = send_text(platform, "💤 **آیا مطمئنی؟**\nکامپیوتر میره به حالت **Sleep**.")
+        ack("Confirming sleep...")
+        r = send_text(platform, "Are you sure?\nComputer will go to sleep.")
         if r and r.get("ok"):
             confirm_id = r["result"]["message_id"]
             base = BALE_API if platform == "bale" else TG_API
             chat = BALE_CHAT if platform == "bale" else TG_CHAT
             api_call(base, "editMessageText", {
                 "chat_id": chat, "message_id": confirm_id,
-                "text": "💤 **آیا مطمئنی؟**\nکامپیوتر میره به حالت **Sleep**.",
+                "text": "Are you sure?\nComputer will go to sleep.",
                 "parse_mode": "Markdown",
                 "reply_markup": {"inline_keyboard": [[
-                    {"text": "✅ آره", "callback_data": "do_sleep"},
-                    {"text": "❌ نه", "callback_data": "cancel"},
+                    {"text": "Yes", "callback_data": "do_sleep"},
+                    {"text": "No", "callback_data": "cancel"},
                 ]]}
             })
             return "confirm", None, confirm_id
         return None, None, None
 
-    # ── دکمه‌های تأیید ──
+    # Confirmation buttons
     if data == "cancel":
-        ack("✅ لغو شد")
+        ack("Cancelled.")
         if cq_msg_id:
             delete_msg(platform, cq_msg_id)
         return "stats", None, None
 
     if data == "do_reboot":
-        ack("🔄 ریستارت...")
-        msg = "🔄 **در حال ریستارت شدن...**\n\nتا چند لحظه دیگه سیستم بالا میاد."
+        ack("Rebooting...")
+        msg = "Rebooting...\nSystem will be back shortly."
         edit_both(msg, {"inline_keyboard": []}, bale_mid, tg_mid)
         subprocess.Popen(["systemctl", "reboot"])
-        # پاک کردن پیام تأیید
         if cq_msg_id:
             delete_msg(platform, cq_msg_id)
         return "executing", msg, None
 
     if data == "do_shutdown":
-        ack("⏻ خاموش...")
-        msg = "⏻ **خاموش شدن...**\n\nتا چند لحظه دیگه سیستم خاموش میشه."
+        ack("Shutting down...")
+        msg = "Shutting down..."
         edit_both(msg, {"inline_keyboard": []}, bale_mid, tg_mid)
         subprocess.Popen(["systemctl", "poweroff"])
         if cq_msg_id:
@@ -645,38 +658,43 @@ def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
         return "executing", msg, None
 
     if data == "do_sleep":
-        ack("💤 خواب...")
-        msg = "💤 **خواب...**\n\nتا چند لحظه دیگه سیستم میره تو حالت Sleep."
+        ack("Going to sleep...")
+        msg = "Going to sleep..."
         edit_both(msg, {"inline_keyboard": []}, bale_mid, tg_mid)
         subprocess.Popen(["systemctl", "suspend"])
         if cq_msg_id:
             delete_msg(platform, cq_msg_id)
         return "executing", msg, None
 
-    # ─── دکمه‌های کامند ───
+    # Command buttons
     if data == "ad":
         txt = cmd_ad(); ack(txt); return None, None, None
     if data == "lock":
         txt = cmd_lock(); ack(txt); return None, None, None
     if data == "cam":
-        ack("📸 یکی دقیقه...")
+        ack("Capturing...")
         r = cmd_cam(); send_cmd_response(platform, r); return None, None, None
     if data == "ss":
-        ack("🖥 یکی دقیقه...")
+        ack("Taking screenshot...")
         r = cmd_ss(); send_cmd_response(platform, r); return None, None, None
     if data == "ip":
-        ack("🌐 ...")
+        ack("Fetching IP...")
         send_cmd_response(platform, ("text", cmd_ip())); return None, None, None
     if data == "wifi":
-        ack("📶 ...")
+        ack("Scanning...")
         send_cmd_response(platform, ("text", cmd_wifi())); return None, None, None
     if data.startswith("vol_"):
         level = data.split("_")[1]; txt = cmd_vol(level); ack(txt); return None, None, None
+    if data == "restart_svc":
+        ack("Restarting service...")
+        txt = cmd_restart_service()
+        send_cmd_response(platform, ("text", txt))
+        return None, None, None
 
     return None, None, None
 
 
-# ─── پال کردن ───
+# ─── Polling ───
 
 def poll_platform(platform, offset):
     fn = bale if platform == "bale" else tg
@@ -688,7 +706,7 @@ def poll_platform(platform, offset):
     new_mode = None
     alt_text = None
     cmds = []
-    cq_msg_id = None  # برای ذخیره message_id callback query
+    cq_msg_id = None
 
     for upd in updates["result"]:
         uid = upd["update_id"]
@@ -696,7 +714,6 @@ def poll_platform(platform, offset):
         cq = upd.get("callback_query")
         if cq:
             new_offset = uid + 1
-            # ذخیره message_id از callback_query (برای پاک کردن)
             cq_msg_id = cq.get("message", {}).get("message_id", None)
             mode, alt, _ = handle_cb(
                 platform,
@@ -723,7 +740,7 @@ def poll_platform(platform, offset):
     return new_offset, new_mode, alt_text, cmds, cq_msg_id
 
 
-# ─── ارسال پاسخ کامند ───
+# ─── Send command response ───
 
 def send_cmd_response(platform, result):
     if result is None: return
@@ -736,115 +753,174 @@ def send_cmd_response(platform, result):
         send_photo(base, chat, result[1], result[2])
 
 
-# ─── ارسال اولیه ───
+# ─── Initial send ───
 
 BALE_MID = None
 TG_MID   = None
 
-def send_initial(text):
+def send_initial_platform(bale_text, tg_text):
     global BALE_MID, TG_MID
-    r = bale("sendMessage", {"chat_id": BALE_CHAT, "text": text,
+    r = bale("sendMessage", {"chat_id": BALE_CHAT, "text": bale_text,
         "parse_mode": "Markdown", "reply_markup": kb("stats")})
     if r and r.get("ok"):
         BALE_MID = r["result"]["message_id"]
-        log.info(f"📨 بله → ID: {BALE_MID}")
+        log.info(f"Bale message ID: {BALE_MID}")
     else:
-        log.error("❌ بله استارت نشد!"); sys.exit(1)
-    r = tg("sendMessage", {"chat_id": TG_CHAT, "text": text,
+        log.error("Failed to send initial message to Bale!")
+        sys.exit(1)
+    r = tg("sendMessage", {"chat_id": TG_CHAT, "text": tg_text,
         "parse_mode": "Markdown", "reply_markup": kb("stats")})
     if r and r.get("ok"):
         TG_MID = r["result"]["message_id"]
-        log.info(f"📨 تلگرام → ID: {TG_MID}")
+        log.info(f"Telegram message ID: {TG_MID}")
     else:
-        log.error("❌ تلگرام استارت نشد!"); sys.exit(1)
-    log.info("✅ هر دو پلتفرم فعالن!")
+        log.error("Failed to send initial message to Telegram!")
+        sys.exit(1)
+    log.info("Both platforms connected.")
 
 
-# ─── لوپ اصلی ───
+# ─── Thermal alerts (separate messages) ───
+
+def _handle_thermal_alerts(cpu_temp, gpu_info):
+    """Check temps every cycle. Send alert if hot, delete if cooled down."""
+    global ALERT_BALE_MID, ALERT_TG_MID
+
+    hot_parts = []
+    if cpu_temp is not None and cpu_temp >= ALERT_THRESHOLD:
+        hot_parts.append(("CPU", cpu_temp))
+    gpu_temp = gpu_info.get("t")
+    if gpu_temp is not None and gpu_temp >= ALERT_THRESHOLD:
+        gpu_name = gpu_info.get("n") or "GPU"
+        hot_parts.append((gpu_name.upper(), gpu_temp))
+
+    if hot_parts:
+        lines = ["THERMAL ALERT", ""]
+        for name, t in hot_parts:
+            lines.append(f"{name} is at {t:.1f}C")
+        lines.append("")
+        lines.append(f"Threshold: {ALERT_THRESHOLD}C")
+        alert_text = "\n".join(lines)
+
+        # delete old alert first
+        _delete_alerts()
+
+        # send new alert to both platforms
+        r_bale = bale("sendMessage", {"chat_id": BALE_CHAT, "text": alert_text, "parse_mode": "Markdown"})
+        if r_bale and r_bale.get("ok"):
+            ALERT_BALE_MID = r_bale["result"]["message_id"]
+
+        r_tg = tg("sendMessage", {"chat_id": TG_CHAT, "text": alert_text, "parse_mode": "Markdown"})
+        if r_tg and r_tg.get("ok"):
+            ALERT_TG_MID = r_tg["result"]["message_id"]
+
+        log.warning(f"Thermal alert sent: {hot_parts}")
+    else:
+        if ALERT_BALE_MID or ALERT_TG_MID:
+            _delete_alerts()
+            log.info("Thermal cleared - alert deleted")
+
+
+def _delete_alerts():
+    global ALERT_BALE_MID, ALERT_TG_MID
+    if ALERT_BALE_MID:
+        bale("deleteMessage", {"chat_id": BALE_CHAT, "message_id": ALERT_BALE_MID})
+        ALERT_BALE_MID = None
+    if ALERT_TG_MID:
+        tg("deleteMessage", {"chat_id": TG_CHAT, "message_id": ALERT_TG_MID})
+        ALERT_TG_MID = None
+
+
+# ─── Main loop ───
 
 def main():
-    global RUNNING, BALE_OFFSET, TG_OFFSET, HOT_TICK, BALE_MID, TG_MID
+    global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID
 
     temp = get_cpu_temp()
     cpu = get_cpu_stats()
     cpu = get_cpu_stats()
     ram, gpu, procs, up = get_ram(), get_gpu(), get_procs(), get_up()
-    is_hot = temp is not None and temp >= ALERT_THRESHOLD
-    text = build_text(temp, cpu, ram, gpu, procs, up, is_hot, update_time=_now_ts())
-    send_initial(text)
 
-    mode = "stats"
-    last_poll = 0.0
+    # Send platform-specific initial text
+    bale_text = build_text(temp, cpu, ram, gpu, procs, up, update_time=_now_ts(), is_bale=True)
+    tg_text   = build_text(temp, cpu, ram, gpu, procs, up, update_time=_now_ts(), is_bale=False)
+    send_initial_platform(bale_text, tg_text)
+
+    mode       = "stats"
+    last_poll  = 0.0
     last_stats = 0.0
-    HOT_TICK = 0
 
     while RUNNING:
-        now = time.time()
+        now  = time.time()
         temp = get_cpu_temp()
-        is_hot = temp is not None and temp >= ALERT_THRESHOLD
 
-        # پال کردن هر ۵ ثانیه
+        # Poll every 5 seconds
         if now - last_poll >= 5:
-            # بله
+            # Bale
             BALE_OFFSET, bm, ba, bcmds, _ = poll_platform("bale", BALE_OFFSET)
             if bm:
                 mode = bm
                 if ba and mode not in ("stats",):
                     edit_both(ba, kb(mode), BALE_MID, TG_MID)
-                    log.info(f"🔘 بله → {mode}")
+                    log.info(f"Bale callback -> {mode}")
             for r in bcmds:
                 send_cmd_response("bale", r)
-                log.info(f"📩 بله ← کامند")
+                log.info("Bale command received")
 
-            # تلگرام
+            # Telegram
             TG_OFFSET, tm, ta, tcmds, _ = poll_platform("tg", TG_OFFSET)
             if tm:
                 mode = tm
                 if ta and mode not in ("stats",):
                     edit_both(ta, kb(mode), BALE_MID, TG_MID)
-                    log.info(f"🔘 تلگرام → {mode}")
+                    log.info(f"Telegram callback -> {mode}")
             for r in tcmds:
                 send_cmd_response("tg", r)
-                log.info(f"📩 تلگرام ← کامند")
+                log.info("Telegram command received")
 
             last_poll = now
 
-        # آپدیت آمار
+        # Stats update
         if mode == "stats":
-            should_update = False
-            skip_info = ""
-            if is_hot:
-                HOT_TICK += 1
-                if HOT_TICK >= HOT_SKIP_RATE:
-                    should_update = True; HOT_TICK = 0
-                skip_info = f"🐌 `1/{HOT_SKIP_RATE}`"
-            else:
-                HOT_TICK = 0
-                if now - last_stats >= INTERVAL_NORMAL or last_stats == 0:
-                    should_update = True
-            if should_update:
+            if now - last_stats >= INTERVAL_NORMAL or last_stats == 0:
                 cpu = get_cpu_stats()
                 ram, gpu, procs, up = get_ram(), get_gpu(), get_procs(), get_up()
-                text = build_text(temp, cpu, ram, gpu, procs, up, is_hot, skip_info, _now_ts())
-                edit_both(text, kb("stats"), BALE_MID, TG_MID)
+                bale_text = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=True)
+                tg_text   = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=False)
+
+                # Edit each platform with its own formatting
+                if BALE_MID:
+                    bale("editMessageText", {
+                        "chat_id": BALE_CHAT, "message_id": BALE_MID,
+                        "text": bale_text, "parse_mode": "Markdown",
+                        "reply_markup": kb("stats")})
+                if TG_MID:
+                    tg("editMessageText", {
+                        "chat_id": TG_CHAT, "message_id": TG_MID,
+                        "text": tg_text, "parse_mode": "Markdown",
+                        "reply_markup": kb("stats")})
+
                 last_stats = now
-                icon = "🔥" if is_hot else "✅"
-                log.info(f"{icon} {temp:.1f}°C ({'hot-skip' if is_hot else '2s'})")
+
+                # Thermal alerts (separate messages)
+                gpu_info = gpu or {}
+                _handle_thermal_alerts(temp, gpu_info)
+
+                log.info(f"{temp:.1f}C | 3s interval")
         elif mode in ("executing", "confirm"):
             time.sleep(5)
 
         time.sleep(0.5)
 
-    # خاموشی تمیز
-    edit_both("🛑 *ربات متوقف شد*", {"inline_keyboard": []}, BALE_MID, TG_MID)
+    # Clean shutdown
+    edit_both("Bot stopped.", {"inline_keyboard": []}, BALE_MID, TG_MID)
     if term_is_active(): term_stop()
-    log.info("✋ خداحافظ!")
+    log.info("Goodbye.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.exception(f"💥 {e}")
+        log.exception(f"Fatal: {e}")
         if term_is_active(): term_stop()
         sys.exit(1)

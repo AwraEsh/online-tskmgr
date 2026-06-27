@@ -1,16 +1,16 @@
-# System Monitor v5 - Bale + Telegram Bot
+# System Monitor v0.2 — Bale + Telegram Bot
 
 > Monitor CPU temperature, usage, RAM, GPU, run terminal, take screenshots, control volume, lock screen, and more — from Bale and Telegram.
 
 <p align="center">
   <a href="README-fa.md" style="color:#2196F3; font-size:18px; text-decoration:none; font-weight:bold;">
-    📖 راهنمای فارسی — README-fa.md
+    Persian Guide — README-fa.md
   </a>
 </p>
 
 ---
 
-## ✨ Features
+## Features
 
 - **CPU**: Temperature, usage, load averages
 - **RAM**: Used/total, swap
@@ -18,15 +18,16 @@
 - **Processes**: Top CPU-consuming processes
 - **Live Terminal**: Full interactive bash shell in chat (`/term`)
 - **Screenshot** + **Webcam** capture
-- **Volume control**, **Screen lock**, **Desktop notifications**
+- **Volume control** (0% / 100%), **Screen lock**, **Desktop notifications**
 - **WiFi scanning**, **IP display**
 - **AnyDesk** remote launch
 - **Power options**: Reboot, Shutdown, Sleep (with confirmation)
-- **Auto-throttling**: Slows updates when CPU > 90°C
+- **Restart Bot**: Restart the bot service from chat
+- **Thermal alerts**: Separate alert message when CPU/GPU exceeds 90C, auto-deleted when cooled down
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 ```bash
 # Python
@@ -45,11 +46,10 @@ sudo apt install ffmpeg libnotify-bin network-manager pulseaudio-utils
 
 ---
 
-## 🚀 Quick Install
+## Quick Install
 
-fo to the diractory where u extracted the zip file
-then:
 ```bash
+cd ~/Documents/My-PJ/bale-cpu-alert
 chmod +x start.sh
 bash start.sh
 ```
@@ -58,7 +58,7 @@ The script checks dependencies, asks for tokens, creates `.env`, sets up systemd
 
 ---
 
-## 📜 Helper Scripts
+## Helper Scripts
 
 ### `start.sh` — Install & Run
 
@@ -86,12 +86,12 @@ bash disable.sh --remove-service
 
 | Command | Stops bot | Disables auto-start | Removes service file |
 |---------|:---------:|:-------------------:|:--------------------:|
-| `bash disable.sh` | ✅ | ✅ | ❌ |
-| `bash disable.sh --remove-service` | ✅ | ✅ | ✅ |
+| `bash disable.sh` | Yes | Yes | No |
+| `bash disable.sh --remove-service` | Yes | Yes | Yes |
 
 ---
 
-## 🛠 Service Management
+## Service Management
 
 | Command | What it does |
 |---------|--------------|
@@ -104,7 +104,7 @@ bash disable.sh --remove-service
 
 ---
 
-## ⚙ Configuration
+## Configuration
 
 Edit `.env` in the project directory:
 
@@ -119,19 +119,38 @@ TG_CHAT_ID=your_telegram_chat_id
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ALERT_THRESHOLD` | 90°C | CPU temp for slow mode |
-| `INTERVAL_NORMAL` | 2s | Normal update interval |
-| `HOT_SKIP_RATE` | 5 | Update every Nth cycle when hot |
+| `ALERT_THRESHOLD` | 90C | Temperature threshold for thermal alerts |
+| `INTERVAL_NORMAL` | 3s | Fixed update interval (always 3s) |
 
 ---
 
-## 📁 File Structure
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Show help message |
+| `/term` | Open live terminal |
+| `/bye` | Close terminal |
+| `/notif <text>` | Send desktop notification |
+| `/vol <0-100>` | Set volume |
+| `/cam` | Capture webcam photo |
+| `/ss` | Take screenshot |
+| `/ip` | Show IP addresses |
+| `/wifi` | Scan WiFi networks |
+| `/ad` | Launch AnyDesk |
+| `/lock` | Lock screen |
+| `/restart` | Restart bot service |
+
+---
+
+## File Structure
 
 ```
 bale-cpu-alert/
 ├── bot.py              # Main bot script
 ├── start.sh            # Installer & launcher
 ├── disable.sh          # Uninstall helper
+├── CHANGELOG.md        # Version history
 ├── README.md           # This file
 ├── README-fa.md        # Persian guide
 ├── .env                # Your tokens (excluded from git)
@@ -140,7 +159,7 @@ bale-cpu-alert/
 
 ---
 
-## 🔒 Security
+## Security
 
 - Keep `.env` private — **never commit it**
 - Power commands (reboot/shutdown/sleep) require confirmation

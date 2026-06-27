@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================
-# System Monitor v5 — Installer & Launcher
+# System Monitor v0.2 — Installer & Launcher
 # Bale + Telegram CPU Alert Bot
 # ==============================================================
 # Checks prerequisites, sets up config, creates systemd service,
