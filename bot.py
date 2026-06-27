@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Monitor v0.3 | Bale + Telegram
+System Monitor v0.3.1 | Bale + Telegram
 - Full system monitor + live terminal (pty)
 - Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
 - Buttons: all commands + power with confirmation + restart service
@@ -30,7 +30,7 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v0.3")
+log = logging.getLogger("sysmon-v0.3.1")
 
 RUNNING = True
 BALE_OFFSET = 0
@@ -414,17 +414,18 @@ def kb(mode="stats"):
 
 
 def edit_both(text, keyboard, bale_mid, tg_mid):
+    global BALE_MID, TG_MID
     threads = []
     if bale_mid:
-        threads.append(threading.Thread(target=lambda: bale("editMessageText", {
-            "chat_id": BALE_CHAT, "message_id": bale_mid,
-            "text": text, "parse_mode": "Markdown",
-            "reply_markup": keyboard})))
+        def _eb_bale():
+            global BALE_MID
+            BALE_MID = _safe_edit("bale", BALE_CHAT, bale_mid, text, keyboard)
+        threads.append(threading.Thread(target=_eb_bale))
     if tg_mid:
-        threads.append(threading.Thread(target=lambda: tg("editMessageText", {
-            "chat_id": TG_CHAT, "message_id": tg_mid,
-            "text": text, "parse_mode": "Markdown",
-            "reply_markup": keyboard})))
+        def _eb_tg():
+            global TG_MID
+            TG_MID = _safe_edit("tg", TG_CHAT, tg_mid, text, keyboard)
+        threads.append(threading.Thread(target=_eb_tg))
     for t in threads: t.start()
     for t in threads: t.join()
 
@@ -441,6 +442,32 @@ def delete_msg(platform, msg_id):
     chat = BALE_CHAT if platform == "bale" else TG_CHAT
     return api_call(base, "deleteMessage", {
         "chat_id": chat, "message_id": msg_id})
+
+
+def _safe_edit(platform, chat_id, msg_id, text, keyboard):
+    """Try to edit existing message. If it fails, send a new one and return the new msg_id."""
+    base = BALE_API if platform == "bale" else TG_API
+    r = api_call(base, "editMessageText", {
+        "chat_id": chat_id, "message_id": msg_id,
+        "text": text, "parse_mode": "Markdown",
+        "reply_markup": keyboard})
+    if r and r.get("ok"):
+        return msg_id
+    # Edit failed — try without Markdown
+    r = api_call(base, "editMessageText", {
+        "chat_id": chat_id, "message_id": msg_id,
+        "text": text, "reply_markup": keyboard})
+    if r and r.get("ok"):
+        return msg_id
+    # Edit completely failed — send new message
+    r = api_call(base, "sendMessage", {
+        "chat_id": chat_id, "text": text,
+        "parse_mode": "Markdown", "reply_markup": keyboard})
+    if r and r.get("ok"):
+        new_id = r["result"]["message_id"]
+        log.warning(f"{platform} edit failed, sent new message {new_id}")
+        return new_id
+    return msg_id
 
 
 # ─── Commands ───
@@ -919,7 +946,7 @@ def _delete_alerts():
 # ─── Main loop ───
 
 def main():
-    global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID
+    global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID, THRESHOLD_WAIT
 
     temp = get_cpu_temp()
     cpu = get_cpu_stats()
@@ -974,19 +1001,23 @@ def main():
                 tg_text   = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=False)
 
                 # Edit each platform with its own formatting (parallel)
+                new_bale_mid = BALE_MID
+                new_tg_mid = TG_MID
                 edit_threads = []
                 if BALE_MID:
-                    edit_threads.append(threading.Thread(target=lambda: bale("editMessageText", {
-                        "chat_id": BALE_CHAT, "message_id": BALE_MID,
-                        "text": bale_text, "parse_mode": "Markdown",
-                        "reply_markup": kb("stats")})))
+                    def _edit_bale():
+                        nonlocal new_bale_mid
+                        new_bale_mid = _safe_edit("bale", BALE_CHAT, BALE_MID, bale_text, kb("stats"))
+                    edit_threads.append(threading.Thread(target=_edit_bale))
                 if TG_MID:
-                    edit_threads.append(threading.Thread(target=lambda: tg("editMessageText", {
-                        "chat_id": TG_CHAT, "message_id": TG_MID,
-                        "text": tg_text, "parse_mode": "Markdown",
-                        "reply_markup": kb("stats")})))
+                    def _edit_tg():
+                        nonlocal new_tg_mid
+                        new_tg_mid = _safe_edit("tg", TG_CHAT, TG_MID, tg_text, kb("stats"))
+                    edit_threads.append(threading.Thread(target=_edit_tg))
                 for t in edit_threads: t.start()
                 for t in edit_threads: t.join()
+                BALE_MID = new_bale_mid
+                TG_MID = new_tg_mid
 
                 last_stats = now
 
