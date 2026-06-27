@@ -47,8 +47,9 @@ sudo apt install ffmpeg libnotify-bin network-manager pulseaudio-utils
 
 ## 🚀 Quick Install
 
+fo to the diractory where u extracted the zip file
+then:
 ```bash
-cd ~/Documents/My-PJ/bale-cpu-alert
 chmod +x start.sh
 bash start.sh
 ```
