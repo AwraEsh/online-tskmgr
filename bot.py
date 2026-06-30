@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-|System Monitor v0.3.3 | Bale + Telegram
-- Full system monitor + live terminal (pty)
-- Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
-- Buttons: all commands + power with confirmation + restart service
+|System Monitor v0.3.6 | Bale + Telegram
+|- Full system monitor + live terminal (pty)
+|- Commands: /term /ad /lock /notif /cam /ss /ip /wifi /vol /restart /bye
+|- Buttons: all commands + power with confirmation + restart service
 """
 
-import os, sys, time, json, glob, logging, signal, subprocess, uuid, io, pty, select, termios, struct, fcntl, errno
+import os, sys, time, json, glob, logging, signal, subprocess, uuid
 from urllib.request import Request, urlopen
 from urllib.error import URLError
-import threading, re
+import threading, re, socket, pty, select, fcntl
 
 # ====== Config ======
 BALE_TOKEN  = os.environ.get("BALE_BOT_TOKEN", "0")
@@ -29,8 +29,26 @@ if not BALE_TOKEN or not BALE_CHAT or not TG_TOKEN or not TG_CHAT:
 BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}/"
 TG_API   = f"https://api.telegram.org/bot{TG_TOKEN}/"
 
+# ─── DNS fallback ───
+# Some ISPs block tapi.bale.ai DNS resolution. Use hardcoded IP as fallback.
+DNS_FALLBACK = {
+    "tapi.bale.ai": "185.143.232.28",
+}
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _dns_fallback_resolver(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    except socket.gaierror:
+        ip = DNS_FALLBACK.get(host)
+        if ip and ip != host:
+            return _orig_getaddrinfo(ip, port, family, type, proto, flags)
+        raise
+
+socket.getaddrinfo = _dns_fallback_resolver
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("sysmon-v0.3.3")
+log = logging.getLogger("sysmon-v0.3.6")
 
 RUNNING = True
 BALE_OFFSET = 0
@@ -40,6 +58,8 @@ PREV_IDLE  = None
 ALERT_BALE_MID = None  # message id of last thermal alert on Bale
 ALERT_TG_MID   = None  # message id of last thermal alert on Telegram
 THRESHOLD_WAIT = None  # {"platform": str, "msg_id": int, "time": float}
+BALE_EDIT_BUSY = False  # guard: don't start a new Bale edit while one is running
+BALE_POLL_BUSY = False  # guard: don't start a new Bale poll while one is running
 
 signal.signal(signal.SIGTERM, lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
 signal.signal(signal.SIGINT,  lambda *_: setattr(sys.modules[__name__], 'RUNNING', False))
@@ -47,15 +67,29 @@ signal.signal(signal.SIGINT,  lambda *_: setattr(sys.modules[__name__], 'RUNNING
 
 # ─── API ───
 
-def api_call(base, method, payload, retries=3):
+def api_call(base, method, payload, retries=3, timeout=10):
     data = json.dumps(payload).encode()
     for attempt in range(retries):
         try:
             req = Request(f"{base}{method}", data=data,
                           headers={"Content-Type": "application/json"})
-            with urlopen(req, timeout=7) as r:
+            with urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
-        except URLError as e:
+        except Exception as e:
+            # DNS fallback for Bale
+            if "tapi.bale.ai" in base and isinstance(e, (URLError, OSError, TimeoutError)):
+                hostname = "tapi.bale.ai"
+                ip = DNS_FALLBACK.get(hostname)
+                if ip:
+                    try:
+                        alt_url = base.replace(hostname, ip)
+                        req = Request(f"{alt_url}{method}", data=data,
+                                      headers={"Content-Type": "application/json",
+                                               "Host": hostname})
+                        with urlopen(req, timeout=timeout) as r2:
+                            return json.loads(r2.read())
+                    except Exception:
+                        pass
             if attempt < retries - 1:
                 log.warning(f"{method} ({attempt+1}): {e}")
                 time.sleep(1)
@@ -63,7 +97,8 @@ def api_call(base, method, payload, retries=3):
 
 
 def bale(method, payload):
-    return api_call(BALE_API, method, payload)
+    """Bale API call with shorter timeout — it's slow/unreliable."""
+    return api_call(BALE_API, method, payload, retries=2, timeout=6)
 
 
 def tg(method, payload):
@@ -90,8 +125,17 @@ def send_photo(base, chat_id, file_path, caption=""):
             f"{caption}\r\n"
             f"--{boundary}--\r\n"
         ).encode()
-        req = Request(f"{base}sendPhoto", data=body,
-                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+        # Use DNS fallback for Bale if needed
+        url = f"{base}sendPhoto"
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if "tapi.bale.ai" in base:
+            ip = DNS_FALLBACK.get("tapi.bale.ai")
+            if ip:
+                url = base.replace("tapi.bale.ai", ip) + "sendPhoto"
+                headers["Host"] = "tapi.bale.ai"
+
+        req = Request(url, data=body, headers=headers)
         with urlopen(req, timeout=30) as r:
             return json.loads(r.read())
     except Exception as e:
@@ -104,10 +148,17 @@ def send_photo(base, chat_id, file_path, caption=""):
 def get_cpu_temp():
     try:
         zones = sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp"))
-        if not zones: return None
-        temps = [int(open(p).read().strip()) / 1000.0 for p in zones if open(p).read().strip()]
+        if not zones:
+            return None
+        temps = []
+        for p in zones:
+            with open(p) as f:
+                val = f.read().strip()
+            if val:
+                temps.append(int(val) / 1000.0)
         return max(temps) if temps else None
-    except: return None
+    except Exception:
+        return None
 
 
 def get_cpu_stats():
@@ -117,7 +168,7 @@ def get_cpu_stats():
             parts = f.readline().strip().split()
         fields = [int(x) for x in parts[1:]]
         # Use ALL fields for total (user + nice + system + idle + iowait + irq + softirq + steal)
-        u, n, s, i = fields[0], fields[1], fields[2], fields[3]
+        i = fields[3]  # idle
         iowait = fields[4] if len(fields) > 4 else 0
         irq = fields[5] if len(fields) > 5 else 0
         sirq = fields[6] if len(fields) > 6 else 0
@@ -162,16 +213,25 @@ def get_gpu():
     except: pass
     try:
         for p in sorted(glob.glob("/sys/class/hwmon/hwmon*/temp*_input")):
-            nm = open(os.path.join(os.path.dirname(p), "name")).read().strip().lower()
+            name_path = os.path.join(os.path.dirname(p), "name")
+            if not os.path.exists(name_path):
+                continue
+            with open(name_path) as f:
+                nm = f.read().strip().lower()
             if any(k in nm for k in ("amdgpu","radeon","nouveau","i915")):
-                info["t"] = float(open(p).read().strip())/1000.0
+                with open(p) as f:
+                    info["t"] = float(f.read().strip()) / 1000.0
                 info["n"] = nm
                 return info
     except: pass
     try:
         ps = sorted(glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp*_input"))
-        if ps: info["t"] = float(open(ps[0]).read().strip())/1000.0; info["n"] = "GPU"
-    except: pass
+        if ps:
+            with open(ps[0]) as f:
+                info["t"] = float(f.read().strip()) / 1000.0
+            info["n"] = "GPU"
+    except:
+        pass
     return info
 
 
@@ -287,17 +347,13 @@ def build_text(temp, cpu, ram, gpu, procs, up, update_time="", is_bale=False):
 
 # ─── Live Terminal (PTY) ───
 
-TERMINAL_PROC = None  # subprocess
 TERMINAL_PID  = None  # pty child pid
 TERMINAL_FD   = None  # pty master fd
 TERMINAL_BUF  = ""    # output buffer
 TERMINAL_PLATFORM = None  # "bale" or "tg"
-TERMINAL_TICK = 0
-TERM_SHELL = "bash"
-TERM_ARGS  = ["--norc", "--noprofile"]
 
 def term_start(platform):
-    global TERMINAL_PROC, TERMINAL_PID, TERMINAL_FD, TERMINAL_BUF, TERMINAL_PLATFORM, TERMINAL_TICK
+    global TERMINAL_PID, TERMINAL_FD, TERMINAL_BUF, TERMINAL_PLATFORM
 
     if TERMINAL_FD is not None:
         return "A terminal is already open. Use /bye first to close it."
@@ -456,61 +512,60 @@ def edit_both(text, keyboard, bale_mid, tg_mid):
 def send_text(platform, text):
     base = BALE_API if platform == "bale" else TG_API
     chat = BALE_CHAT if platform == "bale" else TG_CHAT
+    to = 6 if platform == "bale" else 10
     return api_call(base, "sendMessage", {
-        "chat_id": chat, "text": text, "parse_mode": "Markdown"})
+        "chat_id": chat, "text": text, "parse_mode": "Markdown"}, timeout=to)
 
 
 def delete_msg(platform, msg_id):
     base = BALE_API if platform == "bale" else TG_API
     chat = BALE_CHAT if platform == "bale" else TG_CHAT
+    to = 6 if platform == "bale" else 10
     return api_call(base, "deleteMessage", {
-        "chat_id": chat, "message_id": msg_id})
+        "chat_id": chat, "message_id": msg_id}, timeout=to)
 
 
 def _safe_edit(platform, chat_id, msg_id, text, keyboard):
-    """Try to edit existing message. If it fails, send a new one and return the new msg_id.
-    
-    Strategy:
-    1. Try editMessageText WITH reply_markup (atomic — no flicker, works on Telegram).
-    2. If that fails, try WITHOUT reply_markup + Markdown (Bale-compatible text edit).
-    3. If text edit succeeded, set keyboard separately via editMessageReplyMarkup.
-    4. If all fails, send a new message.
-    """
+    """Try to edit existing message. If it fails, delete+resend (no spam)."""
     base = BALE_API if platform == "bale" else TG_API
+    to = 6 if platform == "bale" else 10
 
     # Step 1: try atomic edit (text + keyboard together — Telegram)
     r = api_call(base, "editMessageText", {
         "chat_id": chat_id, "message_id": msg_id,
         "text": text, "parse_mode": "Markdown",
-        "reply_markup": keyboard})
+        "reply_markup": keyboard}, timeout=to)
     if r and r.get("ok"):
         return msg_id
 
-    # Step 2: failed — try text-only (no keyboard, works on Bale)
+    # Step 2: try text-only (no keyboard)
     r = api_call(base, "editMessageText", {
         "chat_id": chat_id, "message_id": msg_id,
-        "text": text, "parse_mode": "Markdown"})
+        "text": text, "parse_mode": "Markdown"}, timeout=to)
     if not r or not r.get("ok"):
-        # Try without Markdown too
+        # Try without Markdown
         r = api_call(base, "editMessageText", {
             "chat_id": chat_id, "message_id": msg_id,
-            "text": text})
+            "text": text}, timeout=to)
 
     if r and r.get("ok"):
         # Text edit worked — set keyboard separately
         if keyboard:
             api_call(base, "editMessageReplyMarkup", {
                 "chat_id": chat_id, "message_id": msg_id,
-                "reply_markup": keyboard})
+                "reply_markup": keyboard}, timeout=to)
         return msg_id
 
-    # Step 4: completely failed — send new message
+    # Step 3: ALL edits failed — delete old message first, THEN send new one
+    # This prevents message pile-up: at most 1 message visible at any time
+    log.warning(f"{platform} editMessageText failed, deleting+resending")
+    api_call(base, "deleteMessage", {"chat_id": chat_id, "message_id": msg_id}, timeout=to)
     r = api_call(base, "sendMessage", {
         "chat_id": chat_id, "text": text,
-        "parse_mode": "Markdown", "reply_markup": keyboard})
+        "parse_mode": "Markdown", "reply_markup": keyboard}, timeout=to)
     if r and r.get("ok"):
         new_id = r["result"]["message_id"]
-        log.warning(f"{platform} edit failed, sent new message {new_id}")
+        log.info(f"{platform} deleted old msg, sent new one: {new_id}")
         return new_id
     return msg_id
 
@@ -546,7 +601,7 @@ def cmd_ss():
     path = "/tmp/bot_screenshot.jpg"
     try:
         from Xlib import display, X
-        d = display.Display(os.environ.get("DISPLAY", ":1"))
+        d = display.Display(os.environ.get("DISPLAY", ":0"))
         root = d.screen().root; geom = root.get_geometry()
         raw = root.get_image(0, 0, geom.width, geom.height, X.ZPixmap, 0xffffffff)
         from PIL import Image
@@ -560,10 +615,32 @@ def cmd_ip():
     private = "?"
     try: private = subprocess.check_output(["hostname", "-I"], timeout=5).decode().strip().replace(" ", "\n")
     except: pass
-    public = "?"
-    try: public = urlopen(Request("https://api.ipify.org"), timeout=5).read().decode().strip()
-    except: pass
-    return f"IP Address\n---------------\nPrivate:\n{private}\n\nPublic:\n{public}"
+
+    providers = [
+        ("checkip.amazonaws.com", "plain"),
+        ("icanhazip.com", "plain"),
+        ("api.seeip.org", "plain"),
+        ("ident.me", "plain"),
+        ("httpbin.org/ip", "json"),
+    ]
+
+    results = []
+    for url, fmt in providers:
+        try:
+            r = urlopen(Request(f"https://{url}"), timeout=5).read().decode().strip()
+            if fmt == "json":
+                r = json.loads(r).get("origin", r)
+            results.append((url.split("/")[0], r))
+        except Exception:
+            results.append((url.split("/")[0], "⛔ failed"))
+
+    lines = ["IP Address", "---------------",
+             f"Private:\n{private}",
+             "---------------",
+             "Public (multi-source):"]
+    for provider, ip in results:
+        lines.append(f"  {provider}:  {_md(ip, False) if 'failed' not in ip else ip}")
+    return "\n".join(lines)
 
 def cmd_wifi():
     try:
@@ -588,12 +665,10 @@ def cmd_vol(level_str):
 
 
 def cmd_restart_service():
-    """Restart the bale-cpu-alert systemd service."""
-    try:
-        subprocess.run(["systemctl", "--user", "restart", "bale-cpu-alert"], timeout=10)
-        return "Bot service restarting..."
-    except Exception as e:
-        return f"Restart failed: {e}"
+    """Restart the bot via clean exit — systemd Restart=always picks it up."""
+    global RUNNING
+    RUNNING = False  # Signal main loop to exit cleanly
+    return "Restarting bot service..."
 
 
 # ─── Command handler ───
@@ -792,6 +867,11 @@ def handle_cb(platform, cq_id, data, from_id, bale_mid, tg_mid, cq_msg_id):
     if data.startswith("vol_"):
         level = data.split("_")[1]; txt = cmd_vol(level); ack(txt); return None, None, None
     if data == "restart_svc":
+        # Guard: ignore stale callbacks from old bot sessions
+        current_mid = bale_mid if platform == "bale" else tg_mid
+        if cq_msg_id and current_mid and cq_msg_id != current_mid:
+            ack("Stale request ignored.")
+            return None, None, None
         ack("Restarting service...")
         txt = cmd_restart_service()
         send_cmd_response(platform, ("text", txt))
@@ -911,17 +991,18 @@ def send_initial_platform(bale_text, tg_text):
         BALE_MID = r["result"]["message_id"]
         log.info(f"Bale message ID: {BALE_MID}")
     else:
-        log.error("Failed to send initial message to Bale!")
-        sys.exit(1)
+        log.error("Failed to send initial message to Bale! Continuing without Bale...")
     r = tg("sendMessage", {"chat_id": TG_CHAT, "text": tg_text,
         "parse_mode": "Markdown", "reply_markup": kb("stats")})
     if r and r.get("ok"):
         TG_MID = r["result"]["message_id"]
         log.info(f"Telegram message ID: {TG_MID}")
     else:
-        log.error("Failed to send initial message to Telegram!")
+        log.error("Failed to send initial message to Telegram! Continuing without Telegram...")
+    if not BALE_MID and not TG_MID:
+        log.error("Both platforms failed! Exiting.")
         sys.exit(1)
-    log.info("Both platforms connected.")
+    log.info(f"Connected: {'Bale' if BALE_MID else ''}{' + ' if BALE_MID and TG_MID else ''}{'Telegram' if TG_MID else ''}")
 
 
 # ─── Thermal alerts (separate messages) ───
@@ -991,7 +1072,7 @@ def _delete_alerts():
 # ─── Main loop ───
 
 def main():
-    global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID, THRESHOLD_WAIT
+    global RUNNING, BALE_OFFSET, TG_OFFSET, BALE_MID, TG_MID, ALERT_BALE_MID, ALERT_TG_MID, THRESHOLD_WAIT, BALE_EDIT_BUSY, BALE_POLL_BUSY
 
     temp = get_cpu_temp()
     cpu = get_cpu_stats()
@@ -1012,18 +1093,7 @@ def main():
 
         # Poll every 2 seconds
         if now - last_poll >= 2:
-            # Bale
-            BALE_OFFSET, bm, ba, bcmds, _ = poll_platform("bale", BALE_OFFSET)
-            if bm:
-                mode = bm
-                if ba and mode not in ("stats",):
-                    edit_both(ba, kb(mode), BALE_MID, TG_MID)
-                    log.info(f"Bale callback -> {mode}")
-            for r in bcmds:
-                send_cmd_response("bale", r)
-                log.info("Bale command received")
-
-            # Telegram
+            # Telegram first — fast and reliable
             TG_OFFSET, tm, ta, tcmds, _ = poll_platform("tg", TG_OFFSET)
             if tm:
                 mode = tm
@@ -1033,6 +1103,24 @@ def main():
             for r in tcmds:
                 send_cmd_response("tg", r)
                 log.info("Telegram command received")
+
+            # Bale — non-blocking: skip if previous poll still running
+            if not BALE_POLL_BUSY:
+                BALE_POLL_BUSY = True
+                def _poll_bale():
+                    global BALE_OFFSET, BALE_POLL_BUSY
+                    try:
+                        boff, _, _, bcmds, _ = poll_platform("bale", BALE_OFFSET)
+                        if boff:
+                            BALE_OFFSET = boff
+                        for r in bcmds:
+                            send_cmd_response("bale", r)
+                            log.info("Bale command received")
+                    finally:
+                        BALE_POLL_BUSY = False
+                threading.Thread(target=_poll_bale, daemon=True).start()
+            else:
+                log.debug("Bale poll still busy, skipping this cycle")
 
             last_poll = now
 
@@ -1045,22 +1133,46 @@ def main():
                 tg_text   = build_text(temp, cpu, ram, gpu, procs, up, _now_ts(), is_bale=False)
 
                 # Edit each platform with its own formatting (parallel)
-                new_bale_mid = BALE_MID
                 new_tg_mid = TG_MID
-                edit_threads = []
-                if BALE_MID:
-                    def _edit_bale():
-                        nonlocal new_bale_mid
-                        new_bale_mid = _safe_edit("bale", BALE_CHAT, BALE_MID, bale_text, kb("stats"))
-                    edit_threads.append(threading.Thread(target=_edit_bale))
+                tg_thread = None
+
+                # If Bale mid is None but we have internet, try to send initial message
+                if not BALE_MID and temp is not None:
+                    if not BALE_EDIT_BUSY:
+                        BALE_EDIT_BUSY = True
+                        def _init_bale():
+                            global BALE_MID, BALE_EDIT_BUSY
+                            try:
+                                r = bale("sendMessage", {"chat_id": BALE_CHAT, "text": bale_text,
+                                    "parse_mode": "Markdown", "reply_markup": kb("stats")})
+                                if r and r.get("ok"):
+                                    BALE_MID = r["result"]["message_id"]
+                                    log.info(f"Bale reconnected, message ID: {BALE_MID}")
+                            finally:
+                                BALE_EDIT_BUSY = False
+                        t = threading.Thread(target=_init_bale, daemon=True)
+                        t.start()
+                elif BALE_MID:
+                    if not BALE_EDIT_BUSY:
+                        BALE_EDIT_BUSY = True
+                        def _edit_bale():
+                            global BALE_MID, BALE_EDIT_BUSY
+                            try:
+                                BALE_MID = _safe_edit("bale", BALE_CHAT, BALE_MID, bale_text, kb("stats"))
+                            finally:
+                                BALE_EDIT_BUSY = False
+                        t = threading.Thread(target=_edit_bale, daemon=True)
+                        t.start()
+                    else:
+                        log.debug("Bale edit still busy, skipping this cycle")
+
                 if TG_MID:
                     def _edit_tg():
                         nonlocal new_tg_mid
                         new_tg_mid = _safe_edit("tg", TG_CHAT, TG_MID, tg_text, kb("stats"))
-                    edit_threads.append(threading.Thread(target=_edit_tg))
-                for t in edit_threads: t.start()
-                for t in edit_threads: t.join()
-                BALE_MID = new_bale_mid
+                    tg_thread = threading.Thread(target=_edit_tg)
+                    tg_thread.start()
+                    tg_thread.join()
                 TG_MID = new_tg_mid
 
                 last_stats = now
@@ -1083,7 +1195,19 @@ def main():
         time.sleep(0.15)
 
     # Clean shutdown
-    edit_both("Bot stopped.", {"inline_keyboard": []}, BALE_MID, TG_MID)
+    # Confirm offsets so stale callbacks aren't re-sent after restart
+    try:
+        if TG_OFFSET > 0:
+            api_call(TG_API, "getUpdates", {"offset": TG_OFFSET}, retries=1, timeout=3)
+    except:
+        pass
+    try:
+        if BALE_OFFSET > 0:
+            api_call(BALE_API, "getUpdates", {"offset": BALE_OFFSET}, retries=1, timeout=3)
+    except:
+        pass
+
+    edit_both("Bot stopped. Auto-restarting...", {"inline_keyboard": []}, BALE_MID, TG_MID)
     if term_is_active(): term_stop()
     log.info("Goodbye.")
 

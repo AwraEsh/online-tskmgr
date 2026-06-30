@@ -1,4 +1,4 @@
-# System Monitor v0.3.3 — Bale + Telegram Bot
+# System Monitor v0.3.6 — Bale + Telegram Bot
 
 > مانیتورینگ سیستم: دمای CPU، RAM، GPU، ترمینال زنده، اسکرینشات، کنترل صدا و بیشتر — از طریق بله و تلگرام.
 

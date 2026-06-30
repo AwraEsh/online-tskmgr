@@ -159,7 +159,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/python3 $BOT_PY
 Restart=always
-RestartSec=10
+RestartSec=3
 EnvironmentFile=$ENV_FILE
 WorkingDirectory=$SCRIPT_DIR
 
